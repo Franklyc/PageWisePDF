@@ -11,7 +11,7 @@ import time
 import sys
 
 from PyQt5.QtCore import QObject, pyqtSignal
-from pdf2image import convert_from_path
+import fitz  # PyMuPDF
 from pypdf import PdfReader
 import requests
 from PIL import Image
@@ -103,7 +103,7 @@ class PDFProcessor(QObject):
         self.log(self.tr("Starting PDF processing...") if self.language == "English" else "开始处理 PDF...")
         
         try:
-            # Extract total page count
+            # Extract total page count using PyPDF for compatibility
             reader = PdfReader(self.pdf_path)
             total_pages = len(reader.pages)
             self.log(self.tr(f"PDF has {total_pages} pages") if self.language == "English" else f"PDF 有 {total_pages} 页")
@@ -123,62 +123,15 @@ class PDFProcessor(QObject):
                     if self.language == "English" 
                     else f"处理第 {self.start_page} 页到第 {self.end_page} 页（共 {num_pages_to_process} 页）")
             
-            # Step 1: Convert PDF pages to images
+            # Step 1: Convert PDF pages to images using PyMuPDF (fitz)
             self.status_update.emit(self.tr("Converting PDF to images...") if self.language == "English" else "正在将 PDF 转换为图像...")
             self.log(self.tr("Converting PDF pages to images...") if self.language == "English" else "正在将 PDF 页面转换为图像...")
             
-            # Try to find Poppler in common installation directories if not in PATH
-            poppler_path = self.find_poppler_path()
+            image_paths = self.convert_pdf_to_images()
             
-            # Use a temporary directory for PDF to image conversion if memory issues occur
-            with tempfile.TemporaryDirectory() as temp_dir:
-                try:
-                    pdf_images = convert_from_path(
-                        self.pdf_path,
-                        first_page=self.start_page,
-                        last_page=self.end_page,
-                        dpi=300,  # Higher DPI for better OCR
-                        output_folder=temp_dir,
-                        fmt="png",
-                        thread_count=4,
-                        poppler_path=poppler_path
-                    )
-                except Exception as e:
-                    if "poppler" in str(e).lower():
-                        error_msg = self.tr(
-                            "Error: Poppler is not installed or not in PATH. Please install Poppler utilities:\n"
-                            "1. Download from: https://github.com/oschwartz10612/poppler-windows/releases/\n"
-                            "2. Extract to a folder (e.g., C:\\Program Files\\poppler)\n"
-                            "3. Add the bin directory to your system PATH\n"
-                            "4. Restart the application"
-                        ) if self.language == "English" else (
-                            "错误：未安装Poppler或Poppler不在PATH中。请安装Poppler工具：\n"
-                            "1. 从这里下载：https://github.com/oschwartz10612/poppler-windows/releases/\n"
-                            "2. 解压到一个文件夹（例如，C:\\Program Files\\poppler）\n"
-                            "3. 将bin目录添加到系统PATH中\n"
-                            "4. 重启应用程序"
-                        )
-                        self.log(error_msg)
-                        raise Exception(error_msg)
-                    else:
-                        raise
-                
-                # Save images
-                self.log(self.tr("Saving page images...") if self.language == "English" else "正在保存页面图像...")
-                image_paths = []
-                for i, image in enumerate(pdf_images):
-                    page_num = self.start_page + i
-                    image_path = os.path.join(self.images_dir, f"page_{page_num:04d}.png")
-                    image.save(image_path, "PNG")
-                    image_paths.append(image_path)
-                    
-                    # Update progress
-                    progress = int((i + 1) / len(pdf_images) * 50)  # First 50% of progress
-                    self.progress_update.emit(progress)
-                    
-                    if self.is_cancelled():
-                        self.log(self.tr("Operation cancelled.") if self.language == "English" else "操作已取消。")
-                        return
+            if self.is_cancelled():
+                self.log(self.tr("Operation cancelled.") if self.language == "English" else "操作已取消。")
+                return
             
             # Step 2: OCR using OpenAI API
             self.status_update.emit(self.tr("Processing images with OCR...") if self.language == "English" else "正在使用 OCR 处理图像...")
@@ -232,6 +185,58 @@ class PDFProcessor(QObject):
         except Exception as e:
             self.log(self.tr(f"Error: {str(e)}") if self.language == "English" else f"错误：{str(e)}")
             self.status_update.emit(self.tr("Error occurred") if self.language == "English" else "发生错误")
+    
+    def convert_pdf_to_images(self):
+        """Convert PDF pages to images using PyMuPDF (fitz)"""
+        image_paths = []
+        zoom_factor = 3.0  # Adjust for higher resolution images (equivalent to higher DPI)
+        
+        try:
+            # Open the PDF with PyMuPDF
+            pdf_document = fitz.open(self.pdf_path)
+            
+            # Process each page
+            page_count = pdf_document.page_count
+            processed_count = 0
+            
+            # Adjust start/end page for PyMuPDF's 0-based indexing
+            start_idx = self.start_page - 1
+            end_idx = self.end_page - 1
+            
+            for page_idx in range(start_idx, end_idx + 1):
+                if self.is_cancelled():
+                    break
+                
+                # Get the page
+                page = pdf_document[page_idx]
+                page_num = page_idx + 1  # Convert back to 1-based page numbers
+                
+                # Set the transformation matrix for higher resolution
+                matrix = fitz.Matrix(zoom_factor, zoom_factor)
+                
+                # Render page to an image (pixmap)
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
+                
+                # Save the image
+                image_path = os.path.join(self.images_dir, f"page_{page_num:04d}.png")
+                pixmap.save(image_path)
+                image_paths.append(image_path)
+                
+                processed_count += 1
+                # Update progress (50% of total progress is for PDF conversion)
+                progress = int((processed_count / (end_idx - start_idx + 1)) * 50)
+                self.progress_update.emit(progress)
+                
+                self.log(self.tr(f"Converted page {page_num} to image") if self.language == "English" else f"已将第 {page_num} 页转换为图像")
+            
+            # Close the PDF document
+            pdf_document.close()
+            
+        except Exception as e:
+            self.log(self.tr(f"Error converting PDF to images: {str(e)}") if self.language == "English" else f"将PDF转换为图像时出错：{str(e)}")
+            raise
+        
+        return image_paths
     
     def process_page_group(self, image_paths):
         """Process a group of pages with a single API call"""
